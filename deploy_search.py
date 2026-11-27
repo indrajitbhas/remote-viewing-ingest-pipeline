@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -73,11 +74,52 @@ def render(path: Path, values: dict[str, str]) -> dict:
     return json.loads(text)
 
 
+def report_status(client: httpx.Client, indexer: str, index: str, wait_seconds: int) -> int:
+    """Poll the indexer until its last run finishes (or timeout), then print a summary."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        resp = client.get(f"/indexers/{indexer}/status")
+        if resp.status_code >= 400:
+            LOGGER.error("GET indexer status failed (%s): %s", resp.status_code, resp.text)
+            return 1
+        status = resp.json()
+        last = status.get("lastResult") or {}
+        state = last.get("status", "none")
+        if state != "inProgress" or time.monotonic() >= deadline:
+            break
+        LOGGER.info("Indexer in progress (%s items processed)... waiting", last.get("itemsProcessed", 0))
+        time.sleep(15)
+
+    stats = client.get(f"/indexes/{index}/stats")
+    doc_count = stats.json().get("documentCount", "?") if stats.status_code < 400 else "?"
+
+    print(f"Indexer:         {indexer} (service status: {status.get('status')})")
+    print(f"Last run:        {state}  {last.get('startTime', '')} -> {last.get('endTime', '')}")
+    print(f"Items processed: {last.get('itemsProcessed', 0)}   failed: {last.get('itemsFailed', 0)}")
+    print(f"Index chunks:    {doc_count}  ({index}; stats can lag a few minutes)")
+    if last.get("errorMessage"):
+        print(f"Run error:       {last['errorMessage']}")
+    for kind in ("errors", "warnings"):
+        items = last.get(kind) or []
+        if items:
+            print(f"{kind.capitalize()} ({len(items)}):")
+            for item in items[:10]:
+                print(f"  - [{item.get('name') or item.get('key', '')}] {item.get('message') or item.get('errorMessage', '')}")
+    if state == "inProgress":
+        print("Still running: rerun with --status to check again.")
+        return 0
+    return 0 if state == "success" and not last.get("errors") else 1
+
+
 def main() -> int:
     load_dotenv(override=False)
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run", action="store_true", help="Reset and run the indexer after deploying.")
     parser.add_argument("--dry-run", action="store_true", help="Print rendered definitions without calling Azure.")
+    parser.add_argument(
+        "--status", action="store_true", help="Skip deployment; wait for the indexer run and print the result."
+    )
+    parser.add_argument("--wait", type=int, default=600, help="Max seconds --status waits for a running indexer.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -104,6 +146,9 @@ def main() -> int:
     params = {"api-version": API_VERSION}
 
     with httpx.Client(base_url=endpoint, headers=headers, params=params, timeout=60) as client:
+        if args.status:
+            return report_status(client, values["SEARCH_INDEXER"], values["SEARCH_INDEX"], args.wait)
+
         for collection, body, name in rendered:
             resp = client.put(f"/{collection}/{name}", json=body)
             if resp.status_code >= 400:
@@ -119,7 +164,7 @@ def main() -> int:
                     LOGGER.error("%s indexer failed (%s): %s", action, resp.status_code, resp.text)
                     return 1
                 LOGGER.info("Indexer %s: %s", action, resp.status_code)
-            print(f"Indexer started. Check status: GET {endpoint}/indexers/{indexer}/status?api-version={API_VERSION}")
+            print("Indexer started. Check the result with: python deploy_search.py --status")
     return 0
 
 
