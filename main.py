@@ -12,9 +12,15 @@ Authentication to Blob Storage uses ``DefaultAzureCredential`` (``az login``
 locally, managed identity in Azure). The identity needs the
 "Storage Blob Data Contributor" role on the storage account or container.
 
-The graph is built with ``WorkflowBuilder`` so further nodes (content
-understanding, cleanup, chunking, indexing) can be chained after node 1 with
-``.add_edge(extract_source, <next_node>)``.
+Node 2 (``split_parts``) reads that PDF back from Blob Storage and splits it
+at page boundaries into parts whose text stays under the Azure AI Search
+indexer's per-document extraction limit (262,144 characters on this service;
+the full report has ~384k, so a single blob is truncated at page ~119). Parts
+go to ``parts/<doc_id>/`` with ``page_from``/``page_to``/``page_range``
+metadata; the search data source indexes that folder only.
+
+The graph is built with ``WorkflowBuilder``:
+``extract_source -> split_parts``.
 
 See: https://learn.microsoft.com/en-gb/agent-framework/get-started/workflows
 """
@@ -24,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import io
 import logging
 import os
 import sys
@@ -39,6 +46,7 @@ from azure.identity.aio import DefaultAzureCredential
 from azure.storage.blob import ContentSettings
 from azure.storage.blob.aio import BlobServiceClient
 from dotenv import load_dotenv
+from pypdf import PdfReader, PdfWriter
 from typing_extensions import Never
 
 LOGGER = logging.getLogger("rv_ingest_pipeline")
@@ -47,6 +55,10 @@ DEFAULT_SOURCE_URL = "https://nsarchive2.gwu.edu/NSAEBB/NSAEBB54/docs/doc_57.pdf
 DEFAULT_ACCOUNT_URL = "https://uapstorage1.blob.core.windows.net"
 DEFAULT_CONTAINER = "remote-viewing-docs-air-evaluation-1995"
 DEFAULT_BLOB_NAME = "source/air-evaluation-1995.pdf"
+PARTS_PREFIX = "parts"
+# Indexer limit on this service is 262,144 chars; pypdf and the indexer count
+# slightly differently, so keep a safety margin.
+DEFAULT_MAX_PART_CHARS = 200_000
 USER_AGENT = "rv-ingest-pipeline/0.1 (+https://github.com/indrajitbhas)"
 
 
@@ -60,6 +72,7 @@ class AppConfig:
     blob_name: str
     force: bool
     timeout_seconds: float
+    max_part_chars: int = DEFAULT_MAX_PART_CHARS
 
 
 @dataclass(frozen=True)
@@ -84,6 +97,67 @@ class ExtractOutcome:
     sha256: str
     elapsed_seconds: float
     message: str = ""
+
+
+@dataclass(frozen=True)
+class SourceStored:
+    """Message node 1 -> node 2: the source PDF is in Blob Storage."""
+
+    doc: SourceDocument
+    blob_name: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class PartInfo:
+    blob_name: str
+    page_from: int
+    page_to: int
+    chars: int
+
+
+@dataclass(frozen=True)
+class SplitOutcome:
+    """Result of node 2: the page-range parts that the indexer reads."""
+
+    doc_id: str
+    status: str  # "uploaded" | "skipped" | "failed"
+    parts: tuple[PartInfo, ...]
+    total_pages: int
+    elapsed_seconds: float
+    message: str = ""
+
+
+def plan_parts(page_char_counts: list[int], max_chars: int) -> list[tuple[int, int]]:
+    """Group consecutive pages (0-based, inclusive ranges) so each group's text <= max_chars.
+
+    A single page larger than max_chars becomes its own group (cannot split further).
+    """
+    groups: list[tuple[int, int]] = []
+    start, running = 0, 0
+    for i, n in enumerate(page_char_counts):
+        if i > start and running + n > max_chars:
+            groups.append((start, i - 1))
+            start, running = i, 0
+        running += n
+    if page_char_counts:
+        groups.append((start, len(page_char_counts) - 1))
+    return groups
+
+
+def split_pdf(data: bytes, max_chars: int) -> tuple[int, list[tuple[int, int, int, bytes]]]:
+    """Split PDF bytes into (page_from, page_to, chars, pdf_bytes) parts; pages are 1-based."""
+    reader = PdfReader(io.BytesIO(data))
+    counts = [len(page.extract_text() or "") for page in reader.pages]
+    parts = []
+    for first, last in plan_parts(counts, max_chars):
+        writer = PdfWriter()
+        for i in range(first, last + 1):
+            writer.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        writer.write(buf)
+        parts.append((first + 1, last + 1, sum(counts[first : last + 1]), buf.getvalue()))
+    return len(counts), parts
 
 
 AIR_EVALUATION_1995 = SourceDocument(
@@ -126,7 +200,7 @@ class ExtractSourceExecutor(Executor):
         return data
 
     @handler
-    async def extract(self, doc: SourceDocument, ctx: WorkflowContext[Never, ExtractOutcome]) -> None:
+    async def extract(self, doc: SourceDocument, ctx: WorkflowContext[SourceStored, ExtractOutcome]) -> None:
         started = time.perf_counter()
         container = self._blob_service_client.get_container_client(self._config.container)
         blob_client = container.get_blob_client(self._config.blob_name)
@@ -151,6 +225,9 @@ class ExtractSourceExecutor(Executor):
                         elapsed_seconds=time.perf_counter() - started,
                         message="blob already exists",
                     )
+                )
+                await ctx.send_message(
+                    SourceStored(doc, self._config.blob_name, (props.metadata or {}).get("sha256", ""))
                 )
                 return
 
@@ -187,6 +264,7 @@ class ExtractSourceExecutor(Executor):
                     elapsed_seconds=time.perf_counter() - started,
                 )
             )
+            await ctx.send_message(SourceStored(doc, self._config.blob_name, digest))
         except (httpx.HTTPError, AzureError, ValueError) as exc:
             LOGGER.exception("Extraction failed for %s", doc.doc_id)
             await ctx.yield_output(
@@ -202,12 +280,86 @@ class ExtractSourceExecutor(Executor):
             )
 
 
+class SplitPartsExecutor(Executor):
+    """Node 2: split the stored PDF into page-range parts under the indexer text limit.
+
+    Idempotent: skips if parts already exist for the doc (unless ``--force``,
+    which deletes and rewrites them).
+    """
+
+    def __init__(self, id: str, blob_service_client: BlobServiceClient, config: AppConfig):
+        super().__init__(id=id)
+        self._blob_service_client = blob_service_client
+        self._config = config
+
+    @handler
+    async def split(self, msg: SourceStored, ctx: WorkflowContext[Never, SplitOutcome]) -> None:
+        started = time.perf_counter()
+        doc = msg.doc
+        container = self._blob_service_client.get_container_client(self._config.container)
+        prefix = f"{PARTS_PREFIX}/{doc.doc_id}/"
+        try:
+            existing = [b async for b in container.list_blobs(name_starts_with=prefix, include=["metadata"])]
+            if existing and not self._config.force:
+                parts = tuple(
+                    PartInfo(
+                        b.name,
+                        int((b.metadata or {}).get("page_from", 0)),
+                        int((b.metadata or {}).get("page_to", 0)),
+                        int((b.metadata or {}).get("chars", 0)),
+                    )
+                    for b in sorted(existing, key=lambda b: b.name)
+                )
+                LOGGER.info("Skipping split (%d parts exist under %s, use --force)", len(parts), prefix)
+                await ctx.yield_output(
+                    SplitOutcome(doc.doc_id, "skipped", parts, max((p.page_to for p in parts), default=0),
+                                 time.perf_counter() - started, "parts already exist")
+                )
+                return
+            for b in existing:
+                await container.delete_blob(b.name)
+
+            data = await (await container.get_blob_client(msg.blob_name).download_blob()).readall()
+            total_pages, pieces = split_pdf(data, self._config.max_part_chars)
+            pad = len(str(total_pages))
+            parts = []
+            for page_from, page_to, chars, pdf in pieces:
+                name = f"{prefix}{doc.doc_id}-p{page_from:0{pad}d}-{page_to:0{pad}d}.pdf"
+                metadata = {
+                    "doc_id": doc.doc_id,
+                    "title": _ascii_meta(doc.title),
+                    "publisher": _ascii_meta(doc.publisher),
+                    "year": str(doc.year),
+                    "source_url": doc.source_url,
+                    "source_blob": msg.blob_name,
+                    "source_sha256": msg.sha256,
+                    "page_from": str(page_from),
+                    "page_to": str(page_to),
+                    "page_range": f"{page_from}-{page_to}",
+                    "chars": str(chars),
+                    "pipeline_node": self.id,
+                }
+                await container.upload_blob(
+                    name, pdf, overwrite=True, metadata=metadata,
+                    content_settings=ContentSettings(content_type="application/pdf"),
+                )
+                LOGGER.info("Uploaded part %s (pages %d-%d, %d chars)", name, page_from, page_to, chars)
+                parts.append(PartInfo(name, page_from, page_to, chars))
+            await ctx.yield_output(
+                SplitOutcome(doc.doc_id, "uploaded", tuple(parts), total_pages, time.perf_counter() - started)
+            )
+        except (AzureError, ValueError, OSError) as exc:
+            LOGGER.exception("Split failed for %s", doc.doc_id)
+            await ctx.yield_output(
+                SplitOutcome(doc.doc_id, "failed", (), 0, time.perf_counter() - started, str(exc))
+            )
+
+
 def build_workflow(blob_service_client: BlobServiceClient, config: AppConfig) -> Workflow:
-    """Build the workflow graph. Currently: extract_source (node 1)."""
+    """Build the workflow graph: extract_source (node 1) -> split_parts (node 2)."""
     extract_source = ExtractSourceExecutor("extract_source", blob_service_client, config)
-    # Next nodes get chained here, e.g.:
-    #   .add_edge(extract_source, analyze_document)
-    return WorkflowBuilder(start_executor=extract_source).build()
+    split_parts = SplitPartsExecutor("split_parts", blob_service_client, config)
+    return WorkflowBuilder(start_executor=extract_source).add_edge(extract_source, split_parts).build()
 
 
 def _create_parser() -> argparse.ArgumentParser:
@@ -218,7 +370,11 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--account-url", default=None, help="Storage account URL (AZURE_STORAGE_ACCOUNT_URL).")
     parser.add_argument("--container", default=None, help="Target container (BLOB_CONTAINER).")
     parser.add_argument("--blob-name", default=None, help="Target blob name (BLOB_NAME).")
-    parser.add_argument("--force", action="store_true", help="Overwrite the blob if it already exists.")
+    parser.add_argument("--force", action="store_true", help="Overwrite the source blob and re-split parts.")
+    parser.add_argument(
+        "--max-part-chars", type=int, default=None,
+        help=f"Max extracted characters per part (MAX_PART_CHARS, default {DEFAULT_MAX_PART_CHARS}).",
+    )
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP download timeout in seconds.")
     return parser
 
@@ -231,6 +387,7 @@ def _build_config(args: argparse.Namespace) -> AppConfig:
         blob_name=args.blob_name or os.getenv("BLOB_NAME") or DEFAULT_BLOB_NAME,
         force=args.force or os.getenv("FORCE", "").lower() in {"1", "true", "yes"},
         timeout_seconds=args.timeout,
+        max_part_chars=args.max_part_chars or int(os.getenv("MAX_PART_CHARS") or DEFAULT_MAX_PART_CHARS),
     )
 
 
@@ -250,11 +407,13 @@ async def run(config: AppConfig) -> int:
     try:
         workflow = build_workflow(blob_service_client, config)
         result = await workflow.run(doc)
-        outcomes: list[ExtractOutcome] = result.get_outputs()
+        outputs = result.get_outputs()
+        outcomes: list[ExtractOutcome] = [o for o in outputs if isinstance(o, ExtractOutcome)]
+        splits: list[SplitOutcome] = [o for o in outputs if isinstance(o, SplitOutcome)]
 
         print("Summary:")
         for o in outcomes:
-            print(f"  {o.doc_id}: {o.status}")
+            print(f"  [extract_source] {o.doc_id}: {o.status}")
             print(f"    blob:    {o.blob_url}")
             print(f"    size:    {o.size_bytes:,} bytes")
             if o.sha256:
@@ -262,7 +421,15 @@ async def run(config: AppConfig) -> int:
             print(f"    elapsed: {o.elapsed_seconds:.1f}s")
             if o.message:
                 print(f"    note:    {o.message}")
-        return 1 if any(o.status == "failed" for o in outcomes) or not outcomes else 0
+        for s in splits:
+            print(f"  [split_parts] {s.doc_id}: {s.status} ({len(s.parts)} parts, {s.total_pages} pages)")
+            for p in s.parts:
+                print(f"    pages {p.page_from}-{p.page_to}: {p.chars:,} chars  {p.blob_name}")
+            if s.message:
+                print(f"    note:    {s.message}")
+        failed = any(o.status == "failed" for o in outcomes) or any(s.status == "failed" for s in splits)
+        missing_split = any(o.status != "failed" for o in outcomes) and not splits
+        return 1 if failed or missing_split or not outcomes else 0
     finally:
         await blob_service_client.close()
         await credential.close()
