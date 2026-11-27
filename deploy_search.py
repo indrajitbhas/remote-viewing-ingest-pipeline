@@ -21,6 +21,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from azure.identity import DefaultAzureCredential
@@ -53,13 +54,30 @@ STEPS = [
 ]
 
 
+def normalize_endpoint(value: str, env: str) -> str:
+    """Reduce an endpoint to scheme://host.
+
+    Search skills/vectorizers append their own path (``/openai/deployments/...``),
+    so a value like ``https://x.openai.azure.com/openai/v1`` produces a 404.
+    """
+    parts = urlsplit(value.strip())
+    if not parts.scheme or not parts.netloc:
+        raise ValueError(f"{env} is not a valid URL: {value!r}")
+    base = f"{parts.scheme}://{parts.netloc}"
+    if parts.path.strip("/"):
+        LOGGER.warning("%s: dropping path '%s' -> using %s", env, parts.path, base)
+    return base
+
+
 def resolve_values() -> dict[str, str]:
     values, missing = {}, []
     for token, (env, default) in PLACEHOLDERS.items():
         value = (os.getenv(env) or default or "").strip()
         if not value:
             missing.append(env)
-        values[token] = value.rstrip("/") if token.endswith("ENDPOINT") else value
+        if token.endswith("ENDPOINT") and value:
+            value = normalize_endpoint(value, env)
+        values[token] = value
     if missing:
         raise ValueError(f"Missing environment variables: {', '.join(missing)}")
     return values
