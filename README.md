@@ -29,6 +29,7 @@ Chunking, entity/key-phrase extraction and embeddings run in the skillset. See [
 # fill the Azure AI Search section of .env first
 python deploy_search.py --dry-run   # render definitions, no Azure calls
 python deploy_search.py --run       # deploy, then reset + run the indexer
+python deploy_search.py --status    # wait for the indexer run, print items/errors/chunk count
 ```
 
 ## Next nodes
