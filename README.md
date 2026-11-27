@@ -14,7 +14,7 @@ Blob metadata records `source_url`, `sha256`, `retrieved_at`, `title`, `publishe
 
 ## Run
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/Scripts/activate
 pip install -r requirements.txt
 cp .env.example .env
 az login
