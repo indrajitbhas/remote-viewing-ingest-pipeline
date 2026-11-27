@@ -117,13 +117,13 @@
       "key": false
     },
     {
-      "name": "page_range",
-      "type": "Edm.String",
+      "name": "page_number",
+      "type": "Edm.Int32",
       "searchable": false,
       "filterable": true,
       "retrievable": true,
       "stored": true,
-      "sortable": false,
+      "sortable": true,
       "facetable": false,
       "key": false
     },

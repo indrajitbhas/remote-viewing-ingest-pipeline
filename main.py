@@ -13,11 +13,10 @@ locally, managed identity in Azure). The identity needs the
 "Storage Blob Data Contributor" role on the storage account or container.
 
 Node 2 (``split_parts``) reads that PDF back from Blob Storage and splits it
-at page boundaries into parts whose text stays under the Azure AI Search
-indexer's per-document extraction limit (262,144 characters on this service;
-the full report has ~384k, so a single blob is truncated at page ~119). Parts
-go to ``parts/<doc_id>/`` with ``page_from``/``page_to``/``page_range``
-metadata; the search data source indexes that folder only.
+into one PDF per page, so search results can cite the exact page. Each page
+is far below the Azure AI Search indexer's per-document extraction limit
+(262,144 characters). Pages go to ``parts/<doc_id>/`` with an integer
+``page_number`` metadata value; the search data source indexes that folder only.
 
 The graph is built with ``WorkflowBuilder``:
 ``extract_source -> split_parts``.
@@ -56,9 +55,6 @@ DEFAULT_ACCOUNT_URL = "https://uapstorage1.blob.core.windows.net"
 DEFAULT_CONTAINER = "remote-viewing-docs-air-evaluation-1995"
 DEFAULT_BLOB_NAME = "source/air-evaluation-1995.pdf"
 PARTS_PREFIX = "parts"
-# Indexer limit on this service is 262,144 chars; pypdf and the indexer count
-# slightly differently, so keep a safety margin.
-DEFAULT_MAX_PART_CHARS = 200_000
 USER_AGENT = "rv-ingest-pipeline/0.1 (+https://github.com/indrajitbhas)"
 
 
@@ -72,7 +68,6 @@ class AppConfig:
     blob_name: str
     force: bool
     timeout_seconds: float
-    max_part_chars: int = DEFAULT_MAX_PART_CHARS
 
 
 @dataclass(frozen=True)
@@ -111,14 +106,12 @@ class SourceStored:
 @dataclass(frozen=True)
 class PartInfo:
     blob_name: str
-    page_from: int
-    page_to: int
-    chars: int
+    page_number: int  # 1-based
 
 
 @dataclass(frozen=True)
 class SplitOutcome:
-    """Result of node 2: the page-range parts that the indexer reads."""
+    """Result of node 2: the per-page parts that the indexer reads."""
 
     doc_id: str
     status: str  # "uploaded" | "skipped" | "failed"
@@ -128,36 +121,17 @@ class SplitOutcome:
     message: str = ""
 
 
-def plan_parts(page_char_counts: list[int], max_chars: int) -> list[tuple[int, int]]:
-    """Group consecutive pages (0-based, inclusive ranges) so each group's text <= max_chars.
-
-    A single page larger than max_chars becomes its own group (cannot split further).
-    """
-    groups: list[tuple[int, int]] = []
-    start, running = 0, 0
-    for i, n in enumerate(page_char_counts):
-        if i > start and running + n > max_chars:
-            groups.append((start, i - 1))
-            start, running = i, 0
-        running += n
-    if page_char_counts:
-        groups.append((start, len(page_char_counts) - 1))
-    return groups
-
-
-def split_pdf(data: bytes, max_chars: int) -> tuple[int, list[tuple[int, int, int, bytes]]]:
-    """Split PDF bytes into (page_from, page_to, chars, pdf_bytes) parts; pages are 1-based."""
+def split_pdf(data: bytes) -> list[tuple[int, bytes]]:
+    """Split PDF bytes into one single-page PDF per page: (page_number_1based, pdf_bytes)."""
     reader = PdfReader(io.BytesIO(data))
-    counts = [len(page.extract_text() or "") for page in reader.pages]
     parts = []
-    for first, last in plan_parts(counts, max_chars):
+    for i, page in enumerate(reader.pages, start=1):
         writer = PdfWriter()
-        for i in range(first, last + 1):
-            writer.add_page(reader.pages[i])
+        writer.add_page(page)
         buf = io.BytesIO()
         writer.write(buf)
-        parts.append((first + 1, last + 1, sum(counts[first : last + 1]), buf.getvalue()))
-    return len(counts), parts
+        parts.append((i, buf.getvalue()))
+    return parts
 
 
 AIR_EVALUATION_1995 = SourceDocument(
@@ -281,7 +255,7 @@ class ExtractSourceExecutor(Executor):
 
 
 class SplitPartsExecutor(Executor):
-    """Node 2: split the stored PDF into page-range parts under the indexer text limit.
+    """Node 2: split the stored PDF into one PDF per page (exact page citations).
 
     Idempotent: skips if parts already exist for the doc (unless ``--force``,
     which deletes and rewrites them).
@@ -302,17 +276,12 @@ class SplitPartsExecutor(Executor):
             existing = [b async for b in container.list_blobs(name_starts_with=prefix, include=["metadata"])]
             if existing and not self._config.force:
                 parts = tuple(
-                    PartInfo(
-                        b.name,
-                        int((b.metadata or {}).get("page_from", 0)),
-                        int((b.metadata or {}).get("page_to", 0)),
-                        int((b.metadata or {}).get("chars", 0)),
-                    )
+                    PartInfo(b.name, int((b.metadata or {}).get("page_number", 0)))
                     for b in sorted(existing, key=lambda b: b.name)
                 )
                 LOGGER.info("Skipping split (%d parts exist under %s, use --force)", len(parts), prefix)
                 await ctx.yield_output(
-                    SplitOutcome(doc.doc_id, "skipped", parts, max((p.page_to for p in parts), default=0),
+                    SplitOutcome(doc.doc_id, "skipped", parts, max((p.page_number for p in parts), default=0),
                                  time.perf_counter() - started, "parts already exist")
                 )
                 return
@@ -320,11 +289,12 @@ class SplitPartsExecutor(Executor):
                 await container.delete_blob(b.name)
 
             data = await (await container.get_blob_client(msg.blob_name).download_blob()).readall()
-            total_pages, pieces = split_pdf(data, self._config.max_part_chars)
+            pieces = split_pdf(data)
+            total_pages = len(pieces)
             pad = len(str(total_pages))
             parts = []
-            for page_from, page_to, chars, pdf in pieces:
-                name = f"{prefix}{doc.doc_id}-p{page_from:0{pad}d}-{page_to:0{pad}d}.pdf"
+            for page_number, pdf in pieces:
+                name = f"{prefix}{doc.doc_id}-p{page_number:0{pad}d}.pdf"
                 metadata = {
                     "doc_id": doc.doc_id,
                     "title": _ascii_meta(doc.title),
@@ -333,18 +303,15 @@ class SplitPartsExecutor(Executor):
                     "source_url": doc.source_url,
                     "source_blob": msg.blob_name,
                     "source_sha256": msg.sha256,
-                    "page_from": str(page_from),
-                    "page_to": str(page_to),
-                    "page_range": f"{page_from}-{page_to}",
-                    "chars": str(chars),
+                    "page_number": str(page_number),
                     "pipeline_node": self.id,
                 }
                 await container.upload_blob(
                     name, pdf, overwrite=True, metadata=metadata,
                     content_settings=ContentSettings(content_type="application/pdf"),
                 )
-                LOGGER.info("Uploaded part %s (pages %d-%d, %d chars)", name, page_from, page_to, chars)
-                parts.append(PartInfo(name, page_from, page_to, chars))
+                LOGGER.info("Uploaded page %d: %s", page_number, name)
+                parts.append(PartInfo(name, page_number))
             await ctx.yield_output(
                 SplitOutcome(doc.doc_id, "uploaded", tuple(parts), total_pages, time.perf_counter() - started)
             )
@@ -364,17 +331,13 @@ def build_workflow(blob_service_client: BlobServiceClient, config: AppConfig) ->
 
 def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Node 1: download the AIR evaluation (1995) PDF and store it in Azure Blob Storage."
+        description="Download the AIR evaluation (1995) PDF to Azure Blob Storage, then split it into one PDF per page."
     )
     parser.add_argument("--source-url", default=None, help="Override the source PDF URL.")
     parser.add_argument("--account-url", default=None, help="Storage account URL (AZURE_STORAGE_ACCOUNT_URL).")
     parser.add_argument("--container", default=None, help="Target container (BLOB_CONTAINER).")
     parser.add_argument("--blob-name", default=None, help="Target blob name (BLOB_NAME).")
     parser.add_argument("--force", action="store_true", help="Overwrite the source blob and re-split parts.")
-    parser.add_argument(
-        "--max-part-chars", type=int, default=None,
-        help=f"Max extracted characters per part (MAX_PART_CHARS, default {DEFAULT_MAX_PART_CHARS}).",
-    )
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP download timeout in seconds.")
     return parser
 
@@ -387,7 +350,6 @@ def _build_config(args: argparse.Namespace) -> AppConfig:
         blob_name=args.blob_name or os.getenv("BLOB_NAME") or DEFAULT_BLOB_NAME,
         force=args.force or os.getenv("FORCE", "").lower() in {"1", "true", "yes"},
         timeout_seconds=args.timeout,
-        max_part_chars=args.max_part_chars or int(os.getenv("MAX_PART_CHARS") or DEFAULT_MAX_PART_CHARS),
     )
 
 
@@ -424,7 +386,7 @@ async def run(config: AppConfig) -> int:
         for s in splits:
             print(f"  [split_parts] {s.doc_id}: {s.status} ({len(s.parts)} parts, {s.total_pages} pages)")
             for p in s.parts:
-                print(f"    pages {p.page_from}-{p.page_to}: {p.chars:,} chars  {p.blob_name}")
+                print(f"    page {p.page_number}: {p.blob_name}")
             if s.message:
                 print(f"    note:    {s.message}")
         failed = any(o.status == "failed" for o in outcomes) or any(s.status == "failed" for s in splits)

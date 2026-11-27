@@ -15,7 +15,7 @@ Deployed by `../deploy_search.py` (keyless, `DefaultAzureCredential`). `__PLACEH
 |---|---|---|---|
 | `persons`, `organizations`, `locations` | chunk | Entity Recognition | "passages mentioning Puthoff / SRI / CIA" |
 | `key_phrases` | chunk | Key Phrase Extraction | topic facets, semantic keywords |
-| `page_range` | part | blob metadata written by node 2 | citation (e.g. `1-90`); coarse page range, not the exact page |
+| `page_number` | page | blob metadata written by node 2 (`Edm.Int32`, filterable, sortable) | exact page citation, e.g. `$filter=page_number ge 40 and page_number le 60`, `$orderby=page_number` |
 | `doc_id`, `title`, `publisher`, `doc_year` | document | blob metadata written by node 1 | constant today (one document); useful once more documents are added |
 
 Example: `search=accuracy of operational tasking&$filter=organizations/any(o: o eq 'SRI International')&facet=persons,count:20`
@@ -34,7 +34,6 @@ Facet values are the raw entity text, so expect variants ("CIA" vs "Central Inte
 Search service: enable the system-assigned identity, and set API access control to **RBAC** or **Both**.
 
 ## Not included
-- **Exact page numbers**: only the part's `page_range` is kept. Add the Document Layout skill later if per-page citations are needed.
 - **`AZURE_OPENAI_ENDPOINT`** must be the resource root (`https://<name>.openai.azure.com`). `deploy_search.py` strips any path such as `/openai/v1`, which otherwise causes a 404 in the embedding skill.
 - **Chapter/section field**: not reliably produced by built-in skills.
 - `dimensions` is fixed at 1536 (`text-embedding-3-small`). Change it in both `index.json` and `skillset.json` if you use another model.
