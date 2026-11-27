@@ -41,7 +41,6 @@ PLACEHOLDERS: dict[str, tuple[str, str | None]] = {
     "AOAI_ENDPOINT": ("AZURE_OPENAI_ENDPOINT", None),
     "EMBEDDING_DEPLOYMENT": ("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small"),
     "EMBEDDING_MODEL": ("AZURE_OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
-    "AI_SERVICES_ENDPOINT": ("AZURE_AI_SERVICES_ENDPOINT", None),
 }
 
 # (collection, file, placeholder holding the object name)

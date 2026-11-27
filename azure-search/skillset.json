@@ -97,10 +97,6 @@
       ]
     }
   ],
-  "cognitiveServices": {
-    "@odata.type": "#Microsoft.Azure.Search.AIServicesByIdentity",
-    "subdomainUrl": "__AI_SERVICES_ENDPOINT__"
-  },
   "indexProjections": {
     "selectors": [
       {
