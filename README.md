@@ -21,5 +21,15 @@ az login
 python main.py            # add --force to overwrite
 ```
 
+## Azure AI Search (indexing)
+The PDF has a native text layer (Word-generated, 0 images), so AI Search reads it directly: no OCR or Content Understanding.
+Chunking, entity/key-phrase extraction and embeddings run in the skillset. See [`azure-search/README.md`](azure-search/README.md) for the fields and required roles.
+
+```bash
+# fill the Azure AI Search section of .env first
+python deploy_search.py --dry-run   # render definitions, no Azure calls
+python deploy_search.py --run       # deploy, then reset + run the indexer
+```
+
 ## Next nodes
 Chain them in `build_workflow()` with `.add_edge(extract_source, <next_node>)`, e.g. Content Understanding analysis → cleanup → chunking → AI Search indexing.

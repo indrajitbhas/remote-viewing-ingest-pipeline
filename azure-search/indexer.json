@@ -1,0 +1,17 @@
+{
+  "name": "__SEARCH_INDEXER__",
+  "dataSourceName": "__SEARCH_DATASOURCE__",
+  "skillsetName": "__SEARCH_SKILLSET__",
+  "targetIndexName": "__SEARCH_INDEX__",
+  "parameters": {
+    "batchSize": 1,
+    "configuration": {
+      "dataToExtract": "contentAndMetadata",
+      "parsingMode": "default",
+      "indexedFileNameExtensions": ".pdf",
+      "imageAction": "none"
+    }
+  },
+  "fieldMappings": [],
+  "outputFieldMappings": []
+}
