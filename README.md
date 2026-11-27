@@ -25,8 +25,25 @@ python -m venv .venv && source .venv/Scripts/activate
 pip install -r requirements.txt
 cp .env.example .env
 az login
-python main.py            # node 1 + node 2; add --force to overwrite
+python main.py            # AIR 1995: node 1 + node 2; add --force to overwrite
 ```
+
+### Ingesting another PDF
+Same container, same commands. Each document gets `source/<doc_id>.pdf` and `parts/<doc_id>/<doc_id>-pNNN.pdf`, and the existing search data source (`parts/`) picks it up on the next indexer run.
+
+```bash
+# from a URL
+python main.py --source-url "https://www.remoteviewed.com/files/stargate/33SRI%20reports.pdf" \
+  --doc-id sri-reports-33 --title "SRI remote viewing reports (33)" \
+  --publisher "SRI International (via remoteviewed.com)"
+
+# from a local file
+python main.py --file "C:/docs/some-report.pdf" --doc-id some-report --title "Some report" --year 1988
+```
+
+- `--doc-id` is required for anything other than AIR 1995 (lowercase letters, digits, hyphens).
+- The summary prints **pages without extractable text**. Those are usually scanned images. The indexer runs with `imageAction: none`, so they would be indexed empty. If a document has many of them, it needs OCR before indexing. Example: the SRI set (421 pages, 15.9 MB) has **no** text layer on any page, so it would index as 421 empty records without OCR.
+- `BLOB_NAME` in `.env` only applies to AIR 1995, so an old `.env` cannot overwrite the AIR source blob.
 
 ## Azure AI Search (indexing)
 The PDF has a native text layer (Word-generated, 0 images), so AI Search reads it directly: no OCR or Content Understanding.

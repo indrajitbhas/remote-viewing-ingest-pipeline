@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Remote-viewing document ingestion pipeline built with Microsoft Agent Framework workflows.
 
-Node 1 (``extract_source``) downloads the AIR evaluation (1995) PDF
-("An Evaluation of Remote Viewing: Research and Applications", American
-Institutes for Research, 183 pages) from the National Security Archive and
-stores it, with provenance metadata, in Azure Blob Storage:
+Node 1 (``extract_source``) downloads a source PDF (or reads a local file with
+``--file``) and stores it, with provenance metadata, as ``source/<doc_id>.pdf``
+in Azure Blob Storage. With no document flags it ingests the AIR evaluation
+(1995) ("An Evaluation of Remote Viewing: Research and Applications", American
+Institutes for Research, 183 pages) from the National Security Archive. Other
+documents are ingested with ``--doc-id/--title/--publisher/--year``:
 
     https://uapstorage1.blob.core.windows.net/remote-viewing-docs-air-evaluation-1995
 
@@ -32,6 +34,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -53,7 +56,8 @@ LOGGER = logging.getLogger("rv_ingest_pipeline")
 DEFAULT_SOURCE_URL = "https://nsarchive2.gwu.edu/NSAEBB/NSAEBB54/docs/doc_57.pdf"
 DEFAULT_ACCOUNT_URL = "https://uapstorage1.blob.core.windows.net"
 DEFAULT_CONTAINER = "remote-viewing-docs-air-evaluation-1995"
-DEFAULT_BLOB_NAME = "source/air-evaluation-1995.pdf"
+SOURCE_PREFIX = "source"
+DOC_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 PARTS_PREFIX = "parts"
 USER_AGENT = "rv-ingest-pipeline/0.1 (+https://github.com/indrajitbhas)"
 
@@ -68,6 +72,7 @@ class AppConfig:
     blob_name: str
     force: bool
     timeout_seconds: float
+    local_file: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -78,7 +83,7 @@ class SourceDocument:
     title: str
     source_url: str
     publisher: str
-    year: int
+    year: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -119,18 +124,25 @@ class SplitOutcome:
     total_pages: int
     elapsed_seconds: float
     message: str = ""
+    empty_text_pages: tuple[int, ...] = ()
 
 
-def split_pdf(data: bytes) -> list[tuple[int, bytes]]:
-    """Split PDF bytes into one single-page PDF per page: (page_number_1based, pdf_bytes)."""
+def split_pdf(data: bytes) -> list[tuple[int, bytes, bool]]:
+    """Split PDF bytes into one single-page PDF per page.
+
+    Returns (page_number_1based, pdf_bytes, has_text). ``has_text`` is False when
+    the page has no extractable text layer (typically a scanned image), which the
+    indexer (``imageAction: none``) would index as empty.
+    """
     reader = PdfReader(io.BytesIO(data))
     parts = []
     for i, page in enumerate(reader.pages, start=1):
+        has_text = bool((page.extract_text() or "").strip())
         writer = PdfWriter()
         writer.add_page(page)
         buf = io.BytesIO()
         writer.write(buf)
-        parts.append((i, buf.getvalue()))
+        parts.append((i, buf.getvalue(), has_text))
     return parts
 
 
@@ -148,6 +160,19 @@ def _ascii_meta(value: str) -> str:
     return value.encode("ascii", "ignore").decode("ascii")
 
 
+def _doc_metadata(doc: SourceDocument) -> dict[str, str]:
+    """Document-level blob metadata shared by the source blob and every page blob."""
+    meta = {
+        "doc_id": doc.doc_id,
+        "title": _ascii_meta(doc.title),
+        "publisher": _ascii_meta(doc.publisher),
+        "source_url": _ascii_meta(doc.source_url),
+    }
+    if doc.year is not None:
+        meta["year"] = str(doc.year)
+    return meta
+
+
 class ExtractSourceExecutor(Executor):
     """Node 1: download the source PDF and upload it to the Blob container.
 
@@ -159,6 +184,17 @@ class ExtractSourceExecutor(Executor):
         super().__init__(id=id)
         self._blob_service_client = blob_service_client
         self._config = config
+
+    async def _load(self, doc: SourceDocument) -> bytes:
+        if self._config.local_file:
+            LOGGER.info("Reading local file %s", self._config.local_file)
+            with open(self._config.local_file, "rb") as fh:
+                data = fh.read()
+            if not data.startswith(b"%PDF"):
+                raise ValueError(f"{self._config.local_file} is not a PDF (first bytes: {data[:8]!r})")
+            return data
+        LOGGER.info("Downloading %s", doc.source_url)
+        return await self._download(doc.source_url)
 
     async def _download(self, url: str) -> bytes:
         async with httpx.AsyncClient(
@@ -205,17 +241,12 @@ class ExtractSourceExecutor(Executor):
                 )
                 return
 
-            LOGGER.info("Downloading %s", doc.source_url)
-            data = await self._download(doc.source_url)
+            data = await self._load(doc)
             digest = hashlib.sha256(data).hexdigest()
-            LOGGER.info("Downloaded %d bytes (sha256=%s)", len(data), digest)
+            LOGGER.info("Loaded %d bytes (sha256=%s)", len(data), digest)
 
             metadata = {
-                "doc_id": doc.doc_id,
-                "title": _ascii_meta(doc.title),
-                "publisher": _ascii_meta(doc.publisher),
-                "year": str(doc.year),
-                "source_url": doc.source_url,
+                **_doc_metadata(doc),
                 "sha256": digest,
                 "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "pipeline_node": self.id,
@@ -239,7 +270,7 @@ class ExtractSourceExecutor(Executor):
                 )
             )
             await ctx.send_message(SourceStored(doc, self._config.blob_name, digest))
-        except (httpx.HTTPError, AzureError, ValueError) as exc:
+        except (httpx.HTTPError, AzureError, ValueError, OSError) as exc:
             LOGGER.exception("Extraction failed for %s", doc.doc_id)
             await ctx.yield_output(
                 ExtractOutcome(
@@ -293,14 +324,14 @@ class SplitPartsExecutor(Executor):
             total_pages = len(pieces)
             pad = len(str(total_pages))
             parts = []
-            for page_number, pdf in pieces:
+            empty: list[int] = []
+            for page_number, pdf, has_text in pieces:
                 name = f"{prefix}{doc.doc_id}-p{page_number:0{pad}d}.pdf"
+                if not has_text:
+                    empty.append(page_number)
+                    LOGGER.warning("Page %d has no extractable text (scanned?); it will index empty", page_number)
                 metadata = {
-                    "doc_id": doc.doc_id,
-                    "title": _ascii_meta(doc.title),
-                    "publisher": _ascii_meta(doc.publisher),
-                    "year": str(doc.year),
-                    "source_url": doc.source_url,
+                    **_doc_metadata(doc),
                     "source_blob": msg.blob_name,
                     "source_sha256": msg.sha256,
                     "page_number": str(page_number),
@@ -313,7 +344,8 @@ class SplitPartsExecutor(Executor):
                 LOGGER.info("Uploaded page %d: %s", page_number, name)
                 parts.append(PartInfo(name, page_number))
             await ctx.yield_output(
-                SplitOutcome(doc.doc_id, "uploaded", tuple(parts), total_pages, time.perf_counter() - started)
+                SplitOutcome(doc.doc_id, "uploaded", tuple(parts), total_pages, time.perf_counter() - started,
+                             empty_text_pages=tuple(empty))
             )
         except (AzureError, ValueError, OSError) as exc:
             LOGGER.exception("Split failed for %s", doc.doc_id)
@@ -331,40 +363,95 @@ def build_workflow(blob_service_client: BlobServiceClient, config: AppConfig) ->
 
 def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download the AIR evaluation (1995) PDF to Azure Blob Storage, then split it into one PDF per page."
+        description=(
+            "Store a PDF in Azure Blob Storage, then split it into one PDF per page. "
+            "Defaults to the AIR evaluation (1995)."
+        )
     )
-    parser.add_argument("--source-url", default=None, help="Override the source PDF URL.")
+    doc = parser.add_argument_group("document (defaults: AIR evaluation 1995)")
+    doc.add_argument("--source-url", default=None, help="Source PDF URL (SOURCE_URL).")
+    doc.add_argument("--file", default=None, help="Local PDF path instead of downloading (SOURCE_FILE).")
+    doc.add_argument("--doc-id", default=None, help="Document id, lowercase/digits/hyphens; used in blob paths (DOC_ID).")
+    doc.add_argument("--title", default=None, help="Document title (DOC_TITLE).")
+    doc.add_argument("--publisher", default=None, help="Publisher / provenance (DOC_PUBLISHER).")
+    doc.add_argument("--year", type=int, default=None, help="Publication year (DOC_YEAR).")
     parser.add_argument("--account-url", default=None, help="Storage account URL (AZURE_STORAGE_ACCOUNT_URL).")
     parser.add_argument("--container", default=None, help="Target container (BLOB_CONTAINER).")
-    parser.add_argument("--blob-name", default=None, help="Target blob name (BLOB_NAME).")
+    parser.add_argument("--blob-name", default=None, help="Source blob name (BLOB_NAME, default source/<doc_id>.pdf).")
     parser.add_argument("--force", action="store_true", help="Overwrite the source blob and re-split parts.")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP download timeout in seconds.")
     return parser
 
 
-def _build_config(args: argparse.Namespace) -> AppConfig:
+def _build_document(args: argparse.Namespace) -> tuple[SourceDocument, Optional[str]]:
+    """Resolve the document to ingest from CLI flags / env, defaulting to AIR 1995.
+
+    Raises ValueError for an invalid doc id, or when a non-default source is
+    given without an explicit doc id (it would be mislabelled as AIR 1995).
+    """
+    source_url = args.source_url or os.getenv("SOURCE_URL")
+    local_file = args.file or os.getenv("SOURCE_FILE")
+    doc_id = args.doc_id or os.getenv("DOC_ID")
+    year_env = os.getenv("DOC_YEAR")
+    year = args.year if args.year is not None else (int(year_env) if year_env else None)
+
+    custom_source = bool(local_file) or (source_url not in (None, "", DEFAULT_SOURCE_URL))
+    if not doc_id:
+        if custom_source:
+            raise ValueError("--doc-id (DOC_ID) is required when ingesting a document other than AIR 1995")
+        doc_id = AIR_EVALUATION_1995.doc_id
+    if not DOC_ID_PATTERN.match(doc_id):
+        raise ValueError(f"Invalid doc id {doc_id!r}: use lowercase letters, digits and hyphens")
+    if local_file and not os.path.isfile(local_file):
+        raise ValueError(f"--file not found: {local_file}")
+
+    is_air = doc_id == AIR_EVALUATION_1995.doc_id
+    if local_file and not source_url:
+        source_url = f"file://{os.path.basename(local_file)}"
+    doc = SourceDocument(
+        doc_id=doc_id,
+        title=args.title or os.getenv("DOC_TITLE") or (AIR_EVALUATION_1995.title if is_air else doc_id),
+        source_url=source_url or DEFAULT_SOURCE_URL,
+        publisher=args.publisher or os.getenv("DOC_PUBLISHER") or (AIR_EVALUATION_1995.publisher if is_air else ""),
+        year=year if year is not None else (AIR_EVALUATION_1995.year if is_air else None),
+    )
+    return doc, local_file
+
+
+def _resolve_blob_name(args: argparse.Namespace, doc: SourceDocument) -> str:
+    """--blob-name wins; BLOB_NAME env is only honoured for the default AIR document.
+
+    Older .env files set BLOB_NAME=source/air-evaluation-1995.pdf; applying it to
+    another document would overwrite the AIR source blob.
+    """
+    default = f"{SOURCE_PREFIX}/{doc.doc_id}.pdf"
+    if args.blob_name:
+        return args.blob_name
+    env_name = os.getenv("BLOB_NAME")
+    if env_name and env_name != default:
+        if doc.doc_id == AIR_EVALUATION_1995.doc_id:
+            return env_name
+        LOGGER.warning("Ignoring BLOB_NAME=%s for doc %s; using %s", env_name, doc.doc_id, default)
+    return default
+
+
+def _build_config(args: argparse.Namespace, doc: SourceDocument, local_file: Optional[str]) -> AppConfig:
     return AppConfig(
-        source_url=args.source_url or os.getenv("SOURCE_URL") or DEFAULT_SOURCE_URL,
+        source_url=doc.source_url,
         storage_account_url=args.account_url or os.getenv("AZURE_STORAGE_ACCOUNT_URL") or DEFAULT_ACCOUNT_URL,
         container=args.container or os.getenv("BLOB_CONTAINER") or DEFAULT_CONTAINER,
-        blob_name=args.blob_name or os.getenv("BLOB_NAME") or DEFAULT_BLOB_NAME,
+        blob_name=_resolve_blob_name(args, doc),
         force=args.force or os.getenv("FORCE", "").lower() in {"1", "true", "yes"},
         timeout_seconds=args.timeout,
+        local_file=local_file,
     )
 
 
-async def run(config: AppConfig) -> int:
+async def run(config: AppConfig, doc: SourceDocument) -> int:
     credential = DefaultAzureCredential()
     blob_service_client = BlobServiceClient(account_url=config.storage_account_url, credential=credential)
     LOGGER.info("Using DefaultAzureCredential for %s", config.storage_account_url)
-
-    doc = SourceDocument(
-        doc_id=AIR_EVALUATION_1995.doc_id,
-        title=AIR_EVALUATION_1995.title,
-        source_url=config.source_url,
-        publisher=AIR_EVALUATION_1995.publisher,
-        year=AIR_EVALUATION_1995.year,
-    )
+    LOGGER.info("Document: %s (%s) -> %s", doc.doc_id, doc.title, config.blob_name)
 
     try:
         workflow = build_workflow(blob_service_client, config)
@@ -385,8 +472,15 @@ async def run(config: AppConfig) -> int:
                 print(f"    note:    {o.message}")
         for s in splits:
             print(f"  [split_parts] {s.doc_id}: {s.status} ({len(s.parts)} parts, {s.total_pages} pages)")
-            for p in s.parts:
-                print(f"    page {p.page_number}: {p.blob_name}")
+            if s.parts:
+                print(f"    first:   {s.parts[0].blob_name}")
+                print(f"    last:    {s.parts[-1].blob_name}")
+            if s.status == "uploaded":
+                print(f"    pages without extractable text: {len(s.empty_text_pages)}")
+                if s.empty_text_pages:
+                    shown = ", ".join(map(str, s.empty_text_pages[:20]))
+                    more = " ..." if len(s.empty_text_pages) > 20 else ""
+                    print(f"      {shown}{more}  (scanned? these will index empty without OCR)")
             if s.message:
                 print(f"    note:    {s.message}")
         failed = any(o.status == "failed" for o in outcomes) or any(s.status == "failed" for s in splits)
@@ -403,7 +497,12 @@ async def main_async() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     logging.getLogger("azure").setLevel(logging.WARNING)
     try:
-        return await run(_build_config(args))
+        doc, local_file = _build_document(args)
+    except ValueError as exc:
+        LOGGER.error("%s", exc)
+        return 2
+    try:
+        return await run(_build_config(args, doc, local_file), doc)
     except Exception:  # noqa: BLE001
         LOGGER.exception("Fatal error")
         return 3
