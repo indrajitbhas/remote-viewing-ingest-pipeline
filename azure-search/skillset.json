@@ -9,7 +9,6 @@
       "textSplitMode": "pages",
       "maximumPageLength": 2000,
       "pageOverlapLength": 400,
-      "unit": "characters",
       "defaultLanguageCode": "en",
       "inputs": [
         {
