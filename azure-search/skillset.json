@@ -1,0 +1,166 @@
+{
+  "name": "__SEARCH_SKILLSET__",
+  "description": "Chunk native PDF text, extract filterable entities and key phrases per chunk, embed each chunk.",
+  "skills": [
+    {
+      "@odata.type": "#Microsoft.Skills.Text.SplitSkill",
+      "name": "split-pages",
+      "context": "/document",
+      "textSplitMode": "pages",
+      "maximumPageLength": 2000,
+      "pageOverlapLength": 400,
+      "unit": "characters",
+      "defaultLanguageCode": "en",
+      "inputs": [
+        {
+          "name": "text",
+          "source": "/document/content"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "textItems",
+          "targetName": "pages"
+        }
+      ]
+    },
+    {
+      "@odata.type": "#Microsoft.Skills.Text.V3.EntityRecognitionSkill",
+      "name": "entities",
+      "context": "/document/pages/*",
+      "categories": [
+        "Person",
+        "Organization",
+        "Location"
+      ],
+      "minimumPrecision": 0.7,
+      "defaultLanguageCode": "en",
+      "inputs": [
+        {
+          "name": "text",
+          "source": "/document/pages/*"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "persons",
+          "targetName": "persons"
+        },
+        {
+          "name": "organizations",
+          "targetName": "organizations"
+        },
+        {
+          "name": "locations",
+          "targetName": "locations"
+        }
+      ]
+    },
+    {
+      "@odata.type": "#Microsoft.Skills.Text.KeyPhraseExtractionSkill",
+      "name": "key-phrases",
+      "context": "/document/pages/*",
+      "defaultLanguageCode": "en",
+      "maxKeyPhraseCount": 10,
+      "inputs": [
+        {
+          "name": "text",
+          "source": "/document/pages/*"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "keyPhrases",
+          "targetName": "key_phrases"
+        }
+      ]
+    },
+    {
+      "@odata.type": "#Microsoft.Skills.Text.AzureOpenAIEmbeddingSkill",
+      "name": "embed",
+      "context": "/document/pages/*",
+      "resourceUri": "__AOAI_ENDPOINT__",
+      "deploymentId": "__EMBEDDING_DEPLOYMENT__",
+      "modelName": "__EMBEDDING_MODEL__",
+      "dimensions": 1536,
+      "inputs": [
+        {
+          "name": "text",
+          "source": "/document/pages/*"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "embedding",
+          "targetName": "text_vector"
+        }
+      ]
+    }
+  ],
+  "cognitiveServices": {
+    "@odata.type": "#Microsoft.Azure.Search.AIServicesByIdentity",
+    "subdomainUrl": "__AI_SERVICES_ENDPOINT__"
+  },
+  "indexProjections": {
+    "selectors": [
+      {
+        "targetIndexName": "__SEARCH_INDEX__",
+        "parentKeyFieldName": "parent_id",
+        "sourceContext": "/document/pages/*",
+        "mappings": [
+          {
+            "name": "chunk",
+            "source": "/document/pages/*"
+          },
+          {
+            "name": "text_vector",
+            "source": "/document/pages/*/text_vector"
+          },
+          {
+            "name": "persons",
+            "source": "/document/pages/*/persons"
+          },
+          {
+            "name": "organizations",
+            "source": "/document/pages/*/organizations"
+          },
+          {
+            "name": "locations",
+            "source": "/document/pages/*/locations"
+          },
+          {
+            "name": "key_phrases",
+            "source": "/document/pages/*/key_phrases"
+          },
+          {
+            "name": "doc_id",
+            "source": "/document/doc_id"
+          },
+          {
+            "name": "title",
+            "source": "/document/title"
+          },
+          {
+            "name": "publisher",
+            "source": "/document/publisher"
+          },
+          {
+            "name": "doc_year",
+            "source": "/document/year"
+          },
+          {
+            "name": "source_url",
+            "source": "/document/source_url"
+          },
+          {
+            "name": "blob_name",
+            "source": "/document/metadata_storage_name"
+          }
+        ]
+      }
+    ],
+    "parameters": {
+      "projectionMode": "skipIndexingParentDocuments"
+    }
+  }
+}

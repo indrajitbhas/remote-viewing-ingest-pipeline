@@ -1,0 +1,12 @@
+{
+  "name": "__SEARCH_DATASOURCE__",
+  "type": "azureblob",
+  "description": "Remote-viewing source PDFs written by pipeline node 1 (extract_source).",
+  "credentials": {
+    "connectionString": "ResourceId=__STORAGE_RESOURCE_ID__;"
+  },
+  "container": {
+    "name": "__BLOB_CONTAINER__",
+    "query": "source/"
+  }
+}
