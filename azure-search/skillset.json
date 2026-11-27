@@ -152,8 +152,8 @@
             "source": "/document/metadata_storage_name"
           },
           {
-            "name": "page_range",
-            "source": "/document/page_range"
+            "name": "page_number",
+            "source": "/document/page_number"
           }
         ]
       }
