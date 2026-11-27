@@ -9,6 +9,18 @@ Downloads the **AIR evaluation (1995)** PDF ("An Evaluation of Remote Viewing: R
 
 Blob metadata records `source_url`, `sha256`, `retrieved_at`, `title`, `publisher`, `year`. Re-runs are skipped if the blob exists (use `--force` to overwrite).
 
+## Node 2: `split_parts`
+Reads the stored PDF back from Blob Storage and splits it at page boundaries into parts of at most 200,000 extracted characters (`--max-part-chars` / `MAX_PART_CHARS`). The search indexer truncates each blob at 262,144 characters, and the full report has ~384k, so a single blob would lose everything after page ~119.
+
+AIR 1995 becomes 2 parts:
+
+| Blob | Pages | Chars |
+|---|---|---|
+| `parts/air-evaluation-1995/air-evaluation-1995-p001-090.pdf` | 1-90 | 197,837 |
+| `parts/air-evaluation-1995/air-evaluation-1995-p091-183.pdf` | 91-183 | 185,879 |
+
+Each part carries `page_from`, `page_to`, `page_range` and the source metadata. The search data source reads `parts/` only. Skipped if parts exist; `--force` rewrites them.
+
 ## Auth
 `DefaultAzureCredential` (run `az login` locally). Your identity needs **Storage Blob Data Contributor** on `uapstorage1`.
 
@@ -18,7 +30,7 @@ python -m venv .venv && source .venv/Scripts/activate
 pip install -r requirements.txt
 cp .env.example .env
 az login
-python main.py            # add --force to overwrite
+python main.py            # node 1 + node 2; add --force to overwrite
 ```
 
 ## Azure AI Search (indexing)
@@ -33,4 +45,4 @@ python deploy_search.py --status    # wait for the indexer run, print items/erro
 ```
 
 ## Next nodes
-Chain them in `build_workflow()` with `.add_edge(extract_source, <next_node>)`, e.g. Content Understanding analysis → cleanup → chunking → AI Search indexing.
+Chain them in `build_workflow()` with `.add_edge(split_parts, <next_node>)`.

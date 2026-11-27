@@ -117,6 +117,17 @@
       "key": false
     },
     {
+      "name": "page_range",
+      "type": "Edm.String",
+      "searchable": false,
+      "filterable": true,
+      "retrievable": true,
+      "stored": true,
+      "sortable": false,
+      "facetable": false,
+      "key": false
+    },
+    {
       "name": "persons",
       "type": "Collection(Edm.String)",
       "searchable": true,
